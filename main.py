@@ -1,94 +1,101 @@
+import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision
-import torchvision.transforms as transforms
+from torchvision import transforms
+from torchvision.utils import save_image
 
 
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Hyper-parameters 
-input_size = 784
-hidden_size = 500
-num_classes = 10
-num_epochs = 5
-batch_size = 100
-learning_rate = 0.001
+# Create a directory if not exists
+sample_dir = 'samples'
+if not os.path.exists(sample_dir):
+    os.makedirs(sample_dir)
 
-# MNIST dataset 
-train_dataset = torchvision.datasets.MNIST(root='../../data', 
-                                           train=True, 
-                                           transform=transforms.ToTensor(),  
-                                           download=True)
+# Hyper-parameters
+image_size = 784
+h_dim = 400
+z_dim = 20
+num_epochs = 15
+batch_size = 128
+learning_rate = 1e-3
 
-test_dataset = torchvision.datasets.MNIST(root='../../data', 
-                                          train=False, 
-                                          transform=transforms.ToTensor())
+# MNIST dataset
+dataset = torchvision.datasets.MNIST(root='../../data',
+                                     train=True,
+                                     transform=transforms.ToTensor(),
+                                     download=True)
 
 # Data loader
-train_loader = torch.utils.data.DataLoader(dataset=train_dataset, 
-                                           batch_size=batch_size, 
-                                           shuffle=True)
-
-test_loader = torch.utils.data.DataLoader(dataset=test_dataset, 
+data_loader = torch.utils.data.DataLoader(dataset=dataset,
                                           batch_size=batch_size, 
-                                          shuffle=False)
+                                          shuffle=True)
 
-# Fully connected neural network with one hidden layer
-class NeuralNet(nn.Module):
-    def __init__(self, input_size, hidden_size, num_classes):
-        super(NeuralNet, self).__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size) 
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_size, num_classes)  
+
+# VAE model
+class VAE(nn.Module):
+    def __init__(self, image_size=784, h_dim=400, z_dim=20):
+        super(VAE, self).__init__()
+        self.fc1 = nn.Linear(image_size, h_dim)
+        self.fc2 = nn.Linear(h_dim, z_dim)
+        self.fc3 = nn.Linear(h_dim, z_dim)
+        self.fc4 = nn.Linear(z_dim, h_dim)
+        self.fc5 = nn.Linear(h_dim, image_size)
+        
+    def encode(self, x):
+        h = F.relu(self.fc1(x))
+        return self.fc2(h), self.fc3(h)
+    
+    def reparameterize(self, mu, log_var):
+        std = torch.exp(log_var/2)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        h = F.relu(self.fc4(z))
+        return F.sigmoid(self.fc5(h))
     
     def forward(self, x):
-        out = self.fc1(x)
-        out = self.relu(out)
-        out = self.fc2(out)
-        return out
+        mu, log_var = self.encode(x)
+        z = self.reparameterize(mu, log_var)
+        x_reconst = self.decode(z)
+        return x_reconst, mu, log_var
 
-model = NeuralNet(input_size, hidden_size, num_classes).to(device)
+model = VAE().to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-# Loss and optimizer
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)  
-
-# Train the model
-total_step = len(train_loader)
+# Start training
 for epoch in range(num_epochs):
-    for i, (images, labels) in enumerate(train_loader):  
-        # Move tensors to the configured device
-        images = images.reshape(-1, 28*28).to(device)
-        labels = labels.to(device)
-        
+    for i, (x, _) in enumerate(data_loader):
         # Forward pass
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+        x = x.to(device).view(-1, image_size)
+        x_reconst, mu, log_var = model(x)
         
-        # Backward and optimize
+        # Compute reconstruction loss and kl divergence
+        # For KL divergence, see Appendix B in VAE paper or http://yunjey47.tistory.com/43
+        reconst_loss = F.binary_cross_entropy(x_reconst, x, size_average=False)
+        kl_div = - 0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+        
+        # Backprop and optimize
+        loss = reconst_loss + kl_div
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         
-        if (i+1) % 100 == 0:
-            print ('Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}' 
-                   .format(epoch+1, num_epochs, i+1, total_step, loss.item()))
+        if (i+1) % 10 == 0:
+            print ("Epoch[{}/{}], Step [{}/{}], Reconst Loss: {:.4f}, KL Div: {:.4f}" 
+                   .format(epoch+1, num_epochs, i+1, len(data_loader), reconst_loss.item(), kl_div.item()))
+    
+    with torch.no_grad():
+        # Save the sampled images
+        z = torch.randn(batch_size, z_dim).to(device)
+        out = model.decode(z).view(-1, 1, 28, 28)
+        save_image(out, os.path.join(sample_dir, 'sampled-{}.png'.format(epoch+1)))
 
-# Test the model
-# In test phase, we don't need to compute gradients (for memory efficiency)
-with torch.no_grad():
-    correct = 0
-    total = 0
-    for images, labels in test_loader:
-        images = images.reshape(-1, 28*28).to(device)
-        labels = labels.to(device)
-        outputs = model(images)
-        _, predicted = torch.max(outputs.data, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-
-    print('Accuracy of the network on the 10000 test images: {} %'.format(100 * correct / total))
-
-# Save the model checkpoint
-torch.save(model.state_dict(), 'model.ckpt')
+        # Save the reconstructed images
+        out, _, _ = model(x)
+        x_concat = torch.cat([x.view(-1, 1, 28, 28), out.view(-1, 1, 28, 28)], dim=3)
+        save_image(x_concat, os.path.join(sample_dir, 'reconst-{}.png'.format(epoch+1)))
